@@ -1,0 +1,259 @@
+---
+title: "Bayesian A/B"
+author: "Blake Arnold"
+output: html_notebook
+---
+
+
+```{r workspace}
+library(tidyverse)
+library(ggthemes)
+library(gganimate)
+```
+
+```{r experiment simulation function}
+run.sims = function(a.cvr, b.cvr, 
+                    max.obs = 100000, obs.increments = 2000,
+                    n.simulations = 500, seed.value = 5){
+  
+  # When to 'check' experiment results
+  checkins = seq(from = obs.increments, to = max.obs, by = obs.increments)
+  checkins = rep(checkins, times = n.simulations)
+  
+  # Run 'experiments'
+  for(i in 1:n.simulations){
+    # Get the experiment results
+    a.obs = rbernoulli(n = max.obs, p = a.cvr)
+    b.obs = rbernoulli(n = max.obs, p = b.cvr)
+    all.obs = data.frame(n.sim = i, time = 1:max.obs, a.obs, b.obs)
+    
+    # Record the observed result at each experiment 'check-in'
+    all.obs = all.obs %>% 
+      mutate(checkin = ceiling(time / obs.increments) * obs.increments) %>%
+      group_by(n.sim, checkin) %>%
+      summarise(a.conv = sum(a.obs),
+                b.conv = sum(b.obs)) %>%
+      group_by(n.sim) %>%
+      mutate(a.conv = cumsum(a.conv),
+             b.conv = cumsum(b.conv))
+    
+    # Add these results to the record of all experiments
+    if(i == 1){
+      experiment.record = all.obs
+    } else {
+      experiment.record = rbind(experiment.record, all.obs)
+    }
+    #experiment.record = rbind(experiment.record, all.obs)
+  }
+  
+  return(experiment.record)
+  
+}
+```
+
+```{r function to get expected loss from simulated experiments}
+getloss = function(sims, seed.value = 20, 
+                   post.samples = 5000,
+                   prior.alpha = 1, prior.beta = 1){
+  # Create variables to store the loss estimates
+  sims = sims %>% mutate(loss.a = NA, loss.b = NA)
+  
+  # At every check-in time, estimate the loss
+  for(i in 1:nrow(sims)){
+    a.sample = rbeta(n = post.samples, 
+                     shape1 = prior.alpha + sims$a.conv[i], 
+                     shape2 = prior.beta + sims$checkin[i] - sims$a.conv[i])
+    
+    b.sample = rbeta(n = post.samples, 
+                     shape1 = prior.alpha + sims$b.conv[i], 
+                     shape2 = prior.beta + sims$checkin[i] - sims$b.conv[i])
+    
+    sims$loss.a[i] = mean((a.sample < b.sample) * (b.sample - a.sample))
+    sims$loss.b[i] = mean((a.sample > b.sample) * (a.sample - b.sample))
+  }
+  
+  # Returns the original dataframe enriched with expected loss
+  return(sims)
+}
+```
+
+```{r plot the uniform prior distribution, echo = F}
+uni.obs = data.frame(obs = rbeta(n = 10000000, shape1 = 1, shape2 = 1))
+
+ggplot(data = uni.obs, aes(x = obs)) +
+  geom_density(colour = "blue", fill = "blue", alpha = 0.2) +
+  ggtitle("Beta(1,1) prior distribution") +
+  labs(x = "Conversion rate", y = "Density") +
+  theme_tufte()
+```
+
+
+```{r run 500 simulations, echo = F}
+sim1 = run.sims(a.cvr = 0.0020, b.cvr = 0.0025, n.simulations = 500)
+sim1 = getloss(sim1)
+```
+
+```{r show animations for one experiment, echo = F}
+
+  
+one.exp = 
+  sim1 %>%
+  filter(n.sim == 5) %>%
+  mutate(variant = "A",
+         loss = loss.a, 
+         cvr = a.conv / checkin)
+
+one.exp.b = one.exp %>% 
+  mutate(variant = "B",
+         loss = loss.b, 
+         cvr = b.conv / checkin)
+
+one.exp = rbind(one.exp, one.exp.b)
+
+exp.plot.cvr = one.exp %>%
+  ggplot(aes(x = checkin, y = cvr, colour = factor(variant))) +
+  geom_line() +
+  theme_tufte() +
+  ggtitle("Observed conversion rates in one experiment") +
+  labs(x = "Observations for each variant", y = "Conversion rate", colour = "variant") +
+  transition_reveal(checkin) 
+
+exp.plot.cvr
+anim_save(filename = "single_experiment_cvr.gif", animation = last_animation())
+
+exp.plot.loss = one.exp %>%
+  ggplot(aes(x = checkin, y = loss, colour = factor(variant))) +
+  geom_line() +
+  geom_hline(yintercept = 0.00004, linetype = 2, aes(colour = "Threshold")) +
+  theme_tufte() +
+  ggtitle("Expected loss of choosing either variant in one simulated experiment") +
+  labs(x = "Observations for each variant", y = "Expected loss", colour = "variant") +
+  transition_reveal(checkin) 
+
+exp.plot.loss
+anim_save(filename = "single_experiment_loss.gif", animation = last_animation())
+```
+
+```{r show animation for 100 experiments, echo = F}
+exp.plot = sim1 %>%
+  filter(n.sim>= 1, n.sim <= 100) %>%
+  ggplot(aes(x = checkin, colour = factor(n.sim), y = loss.b)) +
+  #geom_line(aes(y = loss.a, colour = "Variant A (true rate 0.20%)")) +
+  geom_line() +
+  theme_tufte() +
+  theme(legend.position = "none") +
+  ggtitle("Expected loss of choosing variant B in simulated experiments") +
+  labs(x = "Sessions for each variant", y = "Expected loss from choosing B") +
+  transition_reveal(checkin) 
+
+exp.plot
+anim_save(filename = "b_loss_animation.gif", animation = last_animation())
+```
+
+```{r show accuracy and speed for 500 experiments, echo = F}
+# Need to pick winner for each experiment and record time decision was made
+threshold = 0.00004
+
+outcomes = sim1 %>% 
+  mutate(threshold.met = (loss.a < threshold | loss.b < threshold)) %>%
+  filter(threshold.met | checkin == max(checkin)) %>%
+  group_by(n.sim) %>%
+  filter(checkin == min(checkin)) %>%
+  mutate(selection = case_when(
+    loss.a < loss.b ~ "A",
+    loss.b < loss.a ~ "B"
+  )) 
+  
+outcomes %>%
+  ggplot(aes(x = checkin * 2)) + # Multiply by two because both variants had this many obs
+  stat_ecdf() +
+  theme_tufte() +
+  ggtitle("eCDF of experiment duration") +
+  labs(x = "Duration", y = "Percent of experiments stopped")
+
+outcomes %>%
+  group_by(selection) %>%
+  summarise(count = n()) %>%
+  mutate(freq = count / sum(count)) %>%
+  ggplot(aes(x = selection, fill = selection, y = freq, label = round(freq, 2))) +
+  geom_bar(stat = "identity") +
+  geom_text(vjust = -0.75, size = 3) +
+  theme_tufte() +
+  ggtitle("Percent of experiments in which variant chosen") +
+  labs(x = "Variant", y = "Percent") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme(legend.position = "none")
+```
+
+```{r run simulations with various effect sizes and plot, echo = F}
+base.rate = 0.0020
+diffs = seq(from = 0.1, to = 0.5, by = 0.1)
+diffs
+all.sims = data.frame()
+
+for(i in 1:length(diffs)){
+  sim = run.sims(a.cvr = base.rate, b.cvr = base.rate * (1 + diffs[i]), n.simulations = 300)
+  sim = getloss(sim)
+  sim = sim %>% mutate(effect.size = diffs[i])
+  if(nrow(all.sims) == 0){
+    all.sims = sim
+  } else{
+    all.sims = rbind(all.sims, sim)
+  }
+}
+
+thresholds = seq(from = 0.00001, to = 0.0004, by = 0.00003)
+
+all.outcomes = data.frame()
+
+for(i in 1:length(thresholds)){
+  outcomes = all.sims %>%
+  mutate(threshold.used = thresholds[i],
+         threshold.met = (loss.a < thresholds[i] | loss.b < thresholds[i])) %>%
+  filter(threshold.met | checkin == max(checkin)) %>%
+  group_by(n.sim, effect.size) %>%
+  filter(checkin == min(checkin)) %>%
+  mutate(selection = case_when(
+    loss.a < loss.b ~ "A",
+    loss.b < loss.a ~ "B"
+  )) 
+  
+  if(i == 1){
+    all.outcomes = outcomes
+  } else {
+    all.outcomes = rbind(all.outcomes, outcomes)
+  }
+  
+}
+
+accuracy = all.outcomes %>%
+  group_by(effect.size, threshold.used, selection) %>%
+  summarise(count = n()) %>%
+  group_by(effect.size, threshold.used) %>%
+  mutate(freq = count / sum(count)) %>%
+  filter(selection == "B") 
+
+accuracy %>%
+  ggplot(aes(x = threshold.used, y = freq, label = round(freq, 2), colour = factor(effect.size))) +
+  geom_line() +
+  geom_text(size = 2.5, vjust = -0.5) +
+  theme_tufte() +
+  labs(colour = "Effect size", x = "Loss threshold", y = "Percentage") +
+  ggtitle("Percent of the time that the better variant is chosen") +
+  coord_cartesian(ylim = c(0, 1))
+
+speed = all.outcomes %>%
+  group_by(effect.size, threshold.used) %>%
+  summarise(duration.75th = quantile(x = checkin * 2, 0.75)) # Multiply by two since both variants have seen this many obs
+  
+speed %>%
+  ggplot(aes(x = threshold.used, y = duration.75th, label = paste(round(duration.75th / 1000, 2), "K", sep = ""), colour = factor(effect.size))) +
+  geom_line() +
+  geom_text(size = 2, vjust = -0.5) +
+  theme_tufte() +
+  labs(colour = "Effect size", x = "Loss threshold", y = "Stopping time") +
+  ggtitle("75th percentile experiment duration") 
+
+```
+
+
